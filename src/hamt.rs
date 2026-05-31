@@ -22,6 +22,7 @@ fn bit_index(hash: u64, level: u32) -> usize {
     ((hash >> (level * BITS)) & MASK) as usize
 }
 
+#[derive(Clone)]
 enum Node<K, V> {
     Leaf { hash: u64, key: K, value: V },
     Interior(SparseArray<Arc<Node<K, V>>>),
@@ -100,53 +101,50 @@ impl<K: Hash + Eq, V> Hamt<K, V> {
         }
     }
 
-    pub fn insert(&self, key: K, value: V) -> Self
+    pub fn insert(&mut self, key: K, value: V)
     where
         K: Clone,
         V: Clone,
     {
         let hash = compute_hash(&key);
-        let (new_root, is_new) = insert_node(self.root.clone(), hash, key, value, 0);
-        Self {
-            root: Some(new_root),
-            len: if is_new { self.len + 1 } else { self.len },
+        let is_new = match &mut self.root {
+            None => {
+                self.root = Some(Arc::new(Node::Leaf { hash, key, value }));
+                true
+            }
+            Some(arc) => insert_node(arc, hash, key, value, 0),
+        };
+        if is_new {
+            self.len += 1;
         }
     }
 
-    pub fn remove<Q>(&self, key: &Q) -> Self
+    pub fn remove<Q>(&mut self, key: &Q) -> bool
     where
         K: Clone + Borrow<Q>,
         V: Clone,
         Q: Hash + Eq + ?Sized,
     {
-        let Some(root) = self.root.clone() else {
-            return Self::default();
+        let Some(arc) = self.root.take() else {
+            return false;
         };
         let hash = compute_hash(key);
-        let (new_root, was_removed) = remove_node(root, hash, key, 0);
-        Self {
-            root: new_root,
-            len: if was_removed { self.len - 1 } else { self.len },
+        let (new_root, was_removed) = remove_node(arc, hash, key, 0);
+        self.root = new_root;
+        if was_removed {
+            self.len -= 1;
         }
+        was_removed
     }
 }
 
-fn insert_node<K, V>(
-    node: Option<Arc<Node<K, V>>>,
-    hash: u64,
-    key: K,
-    value: V,
-    level: u32,
-) -> (Arc<Node<K, V>>, bool)
+// Returns true if the key was newly inserted (false = value was replaced).
+fn insert_node<K, V>(arc: &mut Arc<Node<K, V>>, hash: u64, key: K, value: V, level: u32) -> bool
 where
     K: Clone + Eq,
     V: Clone,
 {
-    let Some(node) = node else {
-        return (Arc::new(Node::Leaf { hash, key, value }), true);
-    };
-
-    match node.as_ref() {
+    match arc.as_ref() {
         Node::Leaf {
             hash: h,
             key: k,
@@ -154,69 +152,78 @@ where
         } => {
             if *h == hash {
                 if k == &key {
-                    (Arc::new(Node::Leaf { hash, key, value }), false)
+                    *Arc::make_mut(arc) = Node::Leaf { hash, key, value };
+                    false
                 } else {
-                    (
-                        Arc::new(Node::Collision {
-                            hash,
-                            entries: vec![(k.clone(), v.clone()), (key, value)],
-                        }),
-                        true,
-                    )
+                    let entries = vec![(k.clone(), v.clone()), (key, value)];
+                    *Arc::make_mut(arc) = Node::Collision { hash, entries };
+                    true
                 }
             } else {
-                // Different hashes: expand this leaf into an interior node and re-insert both.
-                let existing_bit = bit_index(*h, level);
+                let existing_hash = *h;
+                let existing_bit = bit_index(existing_hash, level);
                 let new_bit = bit_index(hash, level);
+                // Borrow of arc via h, k, v ends here (NLL).
                 if existing_bit == new_bit {
                     // Both keys land on the same child slot; push them down one level.
-                    let (child, is_new) =
-                        insert_node(Some(node.clone()), hash, key, value, level + 1);
-                    let arr = SparseArray::default().with_insert(existing_bit, child);
-                    (Arc::new(Node::Interior(arr)), is_new)
+                    let mut subtrie = arc.clone();
+                    let is_new = insert_node(&mut subtrie, hash, key, value, level + 1);
+                    *arc = Arc::new(Node::Interior(
+                        SparseArray::default().with_insert(existing_bit, subtrie),
+                    ));
+                    is_new
                 } else {
-                    let arr = SparseArray::default()
-                        .with_insert(existing_bit, node.clone())
-                        .with_insert(new_bit, Arc::new(Node::Leaf { hash, key, value }));
-                    (Arc::new(Node::Interior(arr)), true)
+                    let existing = arc.clone();
+                    let new_leaf = Arc::new(Node::Leaf { hash, key, value });
+                    *arc = Arc::new(Node::Interior(
+                        SparseArray::default()
+                            .with_insert(existing_bit, existing)
+                            .with_insert(new_bit, new_leaf),
+                    ));
+                    true
                 }
             }
         }
         Node::Interior(arr) => {
             let bit = bit_index(hash, level);
-            let child = arr.get(bit).cloned();
-            let occupied = child.is_some();
-            let (new_child, is_new) = insert_node(child, hash, key, value, level + 1);
-            let new_arr = if occupied {
-                arr.with_replaced(bit, new_child)
-            } else {
-                arr.with_insert(bit, new_child)
+            let occupied = arr.bitmap().has(bit);
+            // Borrow of arc via arr ends here (NLL).
+            let Node::Interior(arr) = Arc::make_mut(arc) else {
+                unreachable!()
             };
-            (Arc::new(Node::Interior(new_arr)), is_new)
+            if occupied {
+                let Ok(idx) = arr.bitmap().rank(bit) else {
+                    unreachable!()
+                };
+                insert_node(&mut arr.entries_mut()[idx], hash, key, value, level + 1)
+            } else {
+                let new_leaf = Arc::new(Node::Leaf { hash, key, value });
+                let new_arr = arr.with_insert(bit, new_leaf);
+                *arr = new_arr;
+                true
+            }
         }
         Node::Collision { hash: h, entries } => {
             debug_assert_eq!(*h, hash);
-            let mut new_entries = entries.clone();
-            let is_new = if let Some(pos) = new_entries.iter().position(|(k, _)| k == &key) {
-                new_entries[pos].1 = value;
+            let pos = entries.iter().position(|(k, _)| k == &key);
+            // Borrow of arc via h, entries ends here (NLL).
+            let Node::Collision { entries, .. } = Arc::make_mut(arc) else {
+                unreachable!()
+            };
+            if let Some(pos) = pos {
+                entries[pos].1 = value;
                 false
             } else {
-                new_entries.push((key, value));
+                entries.push((key, value));
                 true
-            };
-            (
-                Arc::new(Node::Collision {
-                    hash: *h,
-                    entries: new_entries,
-                }),
-                is_new,
-            )
+            }
         }
     }
 }
 
+// Returns the updated node (None = deleted) and whether a key was removed.
 fn remove_node<K, V, Q>(
-    node: Arc<Node<K, V>>,
+    mut arc: Arc<Node<K, V>>,
     hash: u64,
     key: &Q,
     level: u32,
@@ -226,29 +233,39 @@ where
     V: Clone,
     Q: Eq + ?Sized,
 {
-    match node.as_ref() {
+    match arc.as_ref() {
         Node::Leaf {
             hash: h, key: k, ..
         } => {
             if *h == hash && k.borrow() == key {
                 (None, true)
             } else {
-                (Some(node.clone()), false)
+                (Some(arc), false)
             }
         }
         Node::Interior(arr) => {
             let bit = bit_index(hash, level);
-            let Some(child) = arr.get(bit).cloned() else {
-                return (Some(node.clone()), false);
+            let Ok(idx) = arr.bitmap().rank(bit) else {
+                return (Some(arc), false);
             };
+            let child = arr.entries()[idx].clone();
             let (new_child_opt, was_removed) = remove_node(child, hash, key, level + 1);
             if !was_removed {
-                return (Some(node.clone()), false);
+                return (Some(arc), false);
             }
             let new_node = match new_child_opt {
-                Some(new_child) => Arc::new(Node::Interior(arr.with_replaced(bit, new_child))),
+                Some(new_child) => {
+                    let new_arr = arr.with_replaced(bit, new_child);
+                    // Borrow of arr ends here (NLL).
+                    let Node::Interior(arr) = Arc::make_mut(&mut arc) else {
+                        unreachable!()
+                    };
+                    *arr = new_arr;
+                    Some(arc)
+                }
                 None => {
                     let new_arr = arr.with_remove(bit);
+                    // Borrow of arr ends here (NLL).
                     if new_arr.bitmap().is_empty() {
                         return (None, true);
                     }
@@ -259,36 +276,51 @@ where
                             return (Some(only.clone()), true);
                         }
                     }
-                    Arc::new(Node::Interior(new_arr))
+                    let Node::Interior(arr) = Arc::make_mut(&mut arc) else {
+                        unreachable!()
+                    };
+                    *arr = new_arr;
+                    Some(arc)
                 }
             };
-            (Some(new_node), true)
+            (new_node, true)
         }
         Node::Collision { hash: h, entries } => {
             if *h != hash {
-                return (Some(node.clone()), false);
+                return (Some(arc), false);
             }
-            let Some(pos) = entries.iter().position(|(k, _)| k.borrow() == key) else {
-                return (Some(node.clone()), false);
+            let pos = entries.iter().position(|(k, _)| k.borrow() == key);
+            let h = *h;
+            let len = entries.len();
+            // Borrow of arc via h, entries ends here (NLL).
+            let Some(pos) = pos else {
+                return (Some(arc), false);
             };
-            let mut new_entries = entries.clone();
-            new_entries.swap_remove(pos);
-            let new_node = match new_entries.len() {
-                0 => None,
-                1 => {
-                    let (k, v) = new_entries.remove(0);
-                    Some(Arc::new(Node::Leaf {
-                        hash: *h,
+            match len {
+                1 => (None, true),
+                2 => {
+                    // Collapse collision node to a single leaf.
+                    let remaining = 1 - pos;
+                    let Node::Collision { entries, .. } = arc.as_ref() else {
+                        unreachable!()
+                    };
+                    let (k, v) = (entries[remaining].0.clone(), entries[remaining].1.clone());
+                    // Borrow ends here (NLL).
+                    *Arc::make_mut(&mut arc) = Node::Leaf {
+                        hash: h,
                         key: k,
                         value: v,
-                    }))
+                    };
+                    (Some(arc), true)
                 }
-                _ => Some(Arc::new(Node::Collision {
-                    hash: *h,
-                    entries: new_entries,
-                })),
-            };
-            (new_node, true)
+                _ => {
+                    let Node::Collision { entries, .. } = Arc::make_mut(&mut arc) else {
+                        unreachable!()
+                    };
+                    entries.swap_remove(pos);
+                    (Some(arc), true)
+                }
+            }
         }
     }
 }
@@ -351,8 +383,11 @@ where
     V: Clone,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        iter.into_iter()
-            .fold(Hamt::new(), |h, (k, v)| h.insert(k, v))
+        let mut h = Hamt::new();
+        for (k, v) in iter {
+            h.insert(k, v);
+        }
+        h
     }
 }
 
@@ -380,7 +415,10 @@ mod tests {
 
     #[test]
     fn insert_and_get() {
-        let h = Hamt::new().insert("a", 1).insert("b", 2).insert("c", 3);
+        let mut h = Hamt::new();
+        h.insert("a", 1);
+        h.insert("b", 2);
+        h.insert("c", 3);
         assert_eq!(h.len(), 3);
         assert_eq!(h.get("a"), Some(&1));
         assert_eq!(h.get("b"), Some(&2));
@@ -390,33 +428,44 @@ mod tests {
 
     #[test]
     fn insert_replaces_value() {
-        let h = Hamt::new().insert("a", 1).insert("a", 2);
+        let mut h = Hamt::new();
+        h.insert("a", 1);
+        h.insert("a", 2);
         assert_eq!(h.len(), 1);
         assert_eq!(h.get("a"), Some(&2));
     }
 
     #[test]
     fn remove() {
-        let h = Hamt::new().insert("a", 1).insert("b", 2).insert("c", 3);
-        let h2 = h.remove("b");
+        let mut h = Hamt::new();
+        h.insert("a", 1);
+        h.insert("b", 2);
+        h.insert("c", 3);
+        let mut h2 = h.clone();
+        assert!(h2.remove("b"));
         assert_eq!(h2.len(), 2);
         assert_eq!(h2.get("a"), Some(&1));
         assert_eq!(h2.get("b"), None);
         assert_eq!(h2.get("c"), Some(&3));
+        // Original unchanged.
+        assert_eq!(h.get("b"), Some(&2));
     }
 
     #[test]
     fn remove_missing_key() {
-        let h = Hamt::new().insert("a", 1);
-        let h2 = h.remove("z");
-        assert_eq!(h2.len(), 1);
-        assert_eq!(h2.get("a"), Some(&1));
+        let mut h = Hamt::new();
+        h.insert("a", 1);
+        assert!(!h.remove("z"));
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.get("a"), Some(&1));
     }
 
     #[test]
     fn persistence() {
-        let h1 = Hamt::new().insert("a", 1);
-        let h2 = h1.insert("b", 2);
+        let mut h1 = Hamt::new();
+        h1.insert("a", 1);
+        let mut h2 = h1.clone();
+        h2.insert("b", 2);
         assert_eq!(h1.len(), 1);
         assert_eq!(h1.get("b"), None);
         assert_eq!(h2.len(), 2);
@@ -429,7 +478,7 @@ mod tests {
     fn many_inserts_and_gets() {
         let mut h = Hamt::new();
         for i in 0u32..1000 {
-            h = h.insert(i, i * 2);
+            h.insert(i, i * 2);
         }
         assert_eq!(h.len(), 1000);
         for i in 0u32..1000 {
@@ -446,7 +495,10 @@ mod tests {
 
     #[test]
     fn iter_yields_all_pairs() {
-        let h = Hamt::new().insert("a", 1).insert("b", 2).insert("c", 3);
+        let mut h = Hamt::new();
+        h.insert("a", 1);
+        h.insert("b", 2);
+        h.insert("c", 3);
         let mut pairs: Vec<_> = h.iter().map(|(&k, &v)| (k, v)).collect();
         pairs.sort();
         assert_eq!(pairs, vec![("a", 1), ("b", 2), ("c", 3)]);
@@ -454,7 +506,9 @@ mod tests {
 
     #[test]
     fn iter_size_hint_is_exact() {
-        let h = Hamt::new().insert(1u32, 'a').insert(2, 'b');
+        let mut h = Hamt::new();
+        h.insert(1u32, 'a');
+        h.insert(2, 'b');
         let mut it = h.iter();
         assert_eq!(it.len(), 2);
         it.next();
@@ -465,7 +519,9 @@ mod tests {
 
     #[test]
     fn into_iter() {
-        let h = Hamt::new().insert("x", 10).insert("y", 20);
+        let mut h = Hamt::new();
+        h.insert("x", 10);
+        h.insert("y", 20);
         let mut pairs: Vec<_> = (&h).into_iter().map(|(&k, &v)| (k, v)).collect();
         pairs.sort();
         assert_eq!(pairs, vec![("x", 10), ("y", 20)]);
@@ -483,10 +539,10 @@ mod tests {
     fn many_removes() {
         let mut h = Hamt::new();
         for i in 0u32..100 {
-            h = h.insert(i, i);
+            h.insert(i, i);
         }
         for i in 0u32..100 {
-            h = h.remove(&i);
+            assert!(h.remove(&i));
         }
         assert!(h.is_empty());
     }
