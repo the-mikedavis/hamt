@@ -423,6 +423,7 @@ mod tests {
         assert_eq!(h2.get("b"), Some(&2));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn many_inserts_and_gets() {
         let mut h = Hamt::new();
@@ -476,6 +477,7 @@ mod tests {
         assert_eq!(h.get("b"), Some(&2));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn many_removes() {
         let mut h = Hamt::new();
