@@ -185,8 +185,9 @@ where
         Node::Interior(arr) => {
             let bit = bit_index(hash, level);
             let child = arr.get(bit).cloned();
+            let occupied = child.is_some();
             let (new_child, is_new) = insert_node(child, hash, key, value, level + 1);
-            let new_arr = if arr.bitmap().has(bit) {
+            let new_arr = if occupied {
                 arr.with_replaced(bit, new_child)
             } else {
                 arr.with_insert(bit, new_child)

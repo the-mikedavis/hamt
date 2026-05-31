@@ -23,11 +23,12 @@ impl Bitmap {
         (self.0 >> bit) & 1 == 1
     }
 
-    /// Number of set bits strictly below `bit`, i.e. the index of `bit`'s entry in the entries
-    /// array.
-    pub fn rank(self, bit: usize) -> usize {
+    /// Returns `Ok(idx)` if `bit` is set, where `idx` is its physical index in the entries array.
+    /// Returns `Err(idx)` if `bit` is not set, where `idx` is where a new entry would go.
+    pub fn rank(self, bit: usize) -> Result<usize, usize> {
         debug_assert!(bit < 64);
-        (self.0 & ((1u64 << bit) - 1)).count_ones() as usize
+        let idx = (self.0 & ((1u64 << bit) - 1)).count_ones() as usize;
+        if self.has(bit) { Ok(idx) } else { Err(idx) }
     }
 
     pub fn with_set(self, bit: usize) -> Self {
@@ -104,16 +105,20 @@ impl<T> SparseArray<T> {
 
 impl<T> SparseArray<T> {
     pub fn get(&self, bit: usize) -> Option<&T> {
-        let bitmap = self.bitmap();
-        bitmap.has(bit).then(|| &self.entries()[bitmap.rank(bit)])
+        match self.bitmap().rank(bit) {
+            Ok(idx) => Some(&self.entries()[idx]),
+            Err(_) => None,
+        }
     }
 }
 
 impl<T: Clone> SparseArray<T> {
     pub fn with_insert(&self, bit: usize, value: T) -> Self {
         let old_bitmap = self.bitmap();
+        let Err(idx) = old_bitmap.rank(bit) else {
+            panic!("bit {bit} is already occupied")
+        };
         let new_bitmap = old_bitmap.with_set(bit);
-        let idx = old_bitmap.rank(bit);
         let entries = self.entries();
         Self::new(
             new_bitmap,
@@ -127,8 +132,10 @@ impl<T: Clone> SparseArray<T> {
 
     pub fn with_remove(&self, bit: usize) -> Self {
         let old_bitmap = self.bitmap();
+        let Ok(idx) = old_bitmap.rank(bit) else {
+            panic!("bit {bit} is not occupied")
+        };
         let new_bitmap = old_bitmap.with_clear(bit);
-        let idx = old_bitmap.rank(bit);
         let entries = self.entries();
         Self::new(
             new_bitmap,
@@ -140,12 +147,12 @@ impl<T: Clone> SparseArray<T> {
     }
 
     pub fn with_replaced(&self, bit: usize, value: T) -> Self {
-        let bitmap = self.bitmap();
-        debug_assert!(bitmap.has(bit));
-        let idx = bitmap.rank(bit);
+        let Ok(idx) = self.bitmap().rank(bit) else {
+            panic!("bit {bit} is not occupied")
+        };
         let entries = self.entries();
         Self::new(
-            bitmap,
+            self.bitmap(),
             entries[..idx]
                 .iter()
                 .cloned()
@@ -187,14 +194,15 @@ mod tests {
     fn bitmap_ops() {
         let b = Bitmap::EMPTY;
         assert!(!b.has(3));
+        assert_eq!(b.rank(3), Err(0));
         let b = b.with_set(3);
         assert!(b.has(3));
-        assert_eq!(b.rank(3), 0);
+        assert_eq!(b.rank(3), Ok(0));
         let b = b.with_set(7);
-        assert_eq!(b.rank(7), 1); // one bit (3) is below 7
+        assert_eq!(b.rank(7), Ok(1)); // one bit (3) is below 7
         let b = b.with_clear(3);
         assert!(!b.has(3));
-        assert_eq!(b.rank(7), 0); // no bits below 7 now
+        assert_eq!(b.rank(7), Ok(0)); // no bits below 7 now
     }
 
     #[test]
