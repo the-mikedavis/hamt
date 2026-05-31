@@ -1,7 +1,7 @@
 use std::{
     borrow::Borrow,
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hash, Hasher},
     sync::Arc,
 };
 
@@ -10,8 +10,8 @@ use crate::sparse_array::SparseArray;
 const BITS: u32 = 6;
 const MASK: u64 = (1u64 << BITS) - 1;
 
-fn compute_hash<K: Hash + ?Sized>(key: &K) -> u64 {
-    let mut h = DefaultHasher::new();
+fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(build_hasher: &S, key: &K) -> u64 {
+    let mut h = build_hasher.build_hasher();
     key.hash(&mut h);
     h.finish()
 }
@@ -29,29 +29,45 @@ enum Node<K, V> {
     Collision { hash: u64, entries: Vec<(K, V)> },
 }
 
-pub struct Hamt<K, V> {
+pub struct Hamt<K, V, S = RandomState> {
     root: Option<Arc<Node<K, V>>>,
     len: usize,
+    hash_builder: S,
 }
 
-impl<K, V> Default for Hamt<K, V> {
+impl<K, V> Default for Hamt<K, V, RandomState> {
     fn default() -> Self {
-        Self { root: None, len: 0 }
+        Self::new()
     }
 }
 
-impl<K, V> Clone for Hamt<K, V> {
+impl<K, V, S: Clone> Clone for Hamt<K, V, S> {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
             len: self.len,
+            hash_builder: self.hash_builder.clone(),
         }
     }
 }
 
-impl<K: Hash + Eq, V> Hamt<K, V> {
+impl<K, V> Hamt<K, V, RandomState> {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root: None,
+            len: 0,
+            hash_builder: RandomState::new(),
+        }
+    }
+}
+
+impl<K, V, S> Hamt<K, V, S> {
+    pub fn with_hasher(hash_builder: S) -> Self {
+        Self {
+            root: None,
+            len: 0,
+            hash_builder,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -61,13 +77,15 @@ impl<K: Hash + Eq, V> Hamt<K, V> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
 
+impl<K: Hash + Eq, V, S: BuildHasher> Hamt<K, V, S> {
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let hash = compute_hash(key);
+        let hash = compute_hash(&self.hash_builder, key);
         let mut current = self.root.as_deref()?;
         let mut level = 0u32;
         loop {
@@ -106,7 +124,7 @@ impl<K: Hash + Eq, V> Hamt<K, V> {
         K: Clone,
         V: Clone,
     {
-        let hash = compute_hash(&key);
+        let hash = compute_hash(&self.hash_builder, &key);
         let is_new = match &mut self.root {
             None => {
                 self.root = Some(Arc::new(Node::Leaf { hash, key, value }));
@@ -128,7 +146,7 @@ impl<K: Hash + Eq, V> Hamt<K, V> {
         let Some(arc) = self.root.take() else {
             return false;
         };
-        let hash = compute_hash(key);
+        let hash = compute_hash(&self.hash_builder, key);
         let (new_root, was_removed) = remove_node(arc, hash, key, 0);
         self.root = new_root;
         if was_removed {
@@ -368,7 +386,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 
 impl<K, V> ExactSizeIterator for Iter<'_, K, V> {}
 
-impl<'a, K, V> IntoIterator for &'a Hamt<K, V> {
+impl<'a, K, V, S> IntoIterator for &'a Hamt<K, V, S> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V>;
 
@@ -391,7 +409,7 @@ where
     }
 }
 
-impl<K, V> Hamt<K, V> {
+impl<K, V, S> Hamt<K, V, S> {
     pub fn iter(&self) -> Iter<'_, K, V> {
         Iter {
             stack: self.root.as_deref().into_iter().collect(),
@@ -532,6 +550,14 @@ mod tests {
         let h: Hamt<_, _> = [("a", 1), ("b", 2), ("c", 3)].into_iter().collect();
         assert_eq!(h.len(), 3);
         assert_eq!(h.get("b"), Some(&2));
+    }
+
+    #[test]
+    fn with_hasher() {
+        use std::collections::hash_map::RandomState;
+        let mut h: Hamt<&str, i32, _> = Hamt::with_hasher(RandomState::new());
+        h.insert("a", 1);
+        assert_eq!(h.get("a"), Some(&1));
     }
 
     #[cfg_attr(miri, ignore)]
