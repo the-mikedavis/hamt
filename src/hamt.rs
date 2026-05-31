@@ -292,6 +292,79 @@ where
     }
 }
 
+pub struct Iter<'a, K, V> {
+    stack: Vec<&'a Node<K, V>>,
+    collision: Option<std::slice::Iter<'a, (K, V)>>,
+    remaining: usize,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ref mut it) = self.collision {
+                if let Some((k, v)) = it.next() {
+                    self.remaining -= 1;
+                    return Some((k, v));
+                }
+                self.collision = None;
+            }
+
+            match self.stack.pop()? {
+                Node::Leaf { key, value, .. } => {
+                    self.remaining -= 1;
+                    return Some((key, value));
+                }
+                Node::Interior(arr) => {
+                    for child in arr.entries().iter().rev() {
+                        self.stack.push(child.as_ref());
+                    }
+                }
+                Node::Collision { entries, .. } => {
+                    self.collision = Some(entries.iter());
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<K, V> ExactSizeIterator for Iter<'_, K, V> {}
+
+impl<'a, K, V> IntoIterator for &'a Hamt<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for Hamt<K, V>
+where
+    K: Hash + Eq + Clone,
+    V: Clone,
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        iter.into_iter()
+            .fold(Hamt::new(), |h, (k, v)| h.insert(k, v))
+    }
+}
+
+impl<K, V> Hamt<K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            stack: self.root.as_deref().into_iter().collect(),
+            collision: None,
+            remaining: self.len,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +433,47 @@ mod tests {
         for i in 0u32..1000 {
             assert_eq!(h.get(&i), Some(&(i * 2)));
         }
+    }
+
+    #[test]
+    fn iter_empty() {
+        let h: Hamt<&str, i32> = Hamt::new();
+        assert_eq!(h.iter().count(), 0);
+        assert_eq!(h.iter().len(), 0);
+    }
+
+    #[test]
+    fn iter_yields_all_pairs() {
+        let h = Hamt::new().insert("a", 1).insert("b", 2).insert("c", 3);
+        let mut pairs: Vec<_> = h.iter().map(|(&k, &v)| (k, v)).collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![("a", 1), ("b", 2), ("c", 3)]);
+    }
+
+    #[test]
+    fn iter_size_hint_is_exact() {
+        let h = Hamt::new().insert(1u32, 'a').insert(2, 'b');
+        let mut it = h.iter();
+        assert_eq!(it.len(), 2);
+        it.next();
+        assert_eq!(it.len(), 1);
+        it.next();
+        assert_eq!(it.len(), 0);
+    }
+
+    #[test]
+    fn into_iter() {
+        let h = Hamt::new().insert("x", 10).insert("y", 20);
+        let mut pairs: Vec<_> = (&h).into_iter().map(|(&k, &v)| (k, v)).collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![("x", 10), ("y", 20)]);
+    }
+
+    #[test]
+    fn from_iterator() {
+        let h: Hamt<_, _> = [("a", 1), ("b", 2), ("c", 3)].into_iter().collect();
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.get("b"), Some(&2));
     }
 
     #[test]
