@@ -130,7 +130,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> Hamt<K, V, S> {
                 self.root = Some(Arc::new(Node::Leaf { hash, key, value }));
                 true
             }
-            Some(arc) => insert_node(arc, hash, key, value, 0),
+            Some(arc) => insert_node(arc, hash, key, value),
         };
         if is_new {
             self.len += 1;
@@ -157,83 +157,94 @@ impl<K: Hash + Eq, V, S: BuildHasher> Hamt<K, V, S> {
 }
 
 // Returns true if the key was newly inserted (false = value was replaced).
-fn insert_node<K, V>(arc: &mut Arc<Node<K, V>>, hash: u64, key: K, value: V, level: u32) -> bool
+fn insert_node<K, V>(arc: &mut Arc<Node<K, V>>, hash: u64, key: K, value: V) -> bool
 where
     K: Clone + Eq,
     V: Clone,
 {
-    match arc.as_ref() {
-        Node::Leaf {
-            hash: h,
-            key: k,
-            value: v,
-        } => {
-            if *h == hash {
-                if k == &key {
-                    *Arc::make_mut(arc) = Node::Leaf { hash, key, value };
-                    false
-                } else {
-                    let entries = vec![(k.clone(), v.clone()), (key, value)];
-                    *Arc::make_mut(arc) = Node::Collision { hash, entries };
-                    true
+    // Raw pointer cursor: lets us advance through Interior nodes without fighting
+    // the borrow checker's lifetime rules on the loop-carried &mut reference.
+    // SAFETY: ptr always points to an Arc<Node> that is kept alive by the trie
+    // (either the root or a slot in a parent Interior's SparseArray). We hold
+    // exclusive access via the original &mut arc, so no aliasing is possible.
+    let mut ptr: *mut Arc<Node<K, V>> = arc;
+    let mut level = 0u32;
+
+    loop {
+        let current: &mut Arc<Node<K, V>> = unsafe { &mut *ptr };
+
+        match current.as_ref() {
+            Node::Leaf {
+                hash: h,
+                key: k,
+                value: v,
+            } => {
+                if *h == hash {
+                    if k == &key {
+                        *Arc::make_mut(current) = Node::Leaf { hash, key, value };
+                        return false;
+                    } else {
+                        let entries = vec![(k.clone(), v.clone()), (key, value)];
+                        *Arc::make_mut(current) = Node::Collision { hash, entries };
+                        return true;
+                    }
                 }
-            } else {
                 let existing_hash = *h;
                 let existing_bit = bit_index(existing_hash, level);
                 let new_bit = bit_index(hash, level);
-                // Borrow of arc via h, k, v ends here (NLL).
+                // Borrow of current via h, k, v ends here (NLL).
                 if existing_bit == new_bit {
-                    // Both keys land on the same child slot; push them down one level.
-                    let mut subtrie = arc.clone();
-                    let is_new = insert_node(&mut subtrie, hash, key, value, level + 1);
-                    *arc = Arc::new(Node::Interior(
-                        SparseArray::default().with_insert(existing_bit, subtrie),
+                    // Wrap the existing leaf in a new Interior; the next iteration
+                    // will descend through it and try again at level + 1.
+                    let existing = current.clone();
+                    *current = Arc::new(Node::Interior(
+                        SparseArray::default().with_insert(existing_bit, existing),
                     ));
-                    is_new
                 } else {
-                    let existing = arc.clone();
+                    let existing = current.clone();
                     let new_leaf = Arc::new(Node::Leaf { hash, key, value });
-                    *arc = Arc::new(Node::Interior(
+                    *current = Arc::new(Node::Interior(
                         SparseArray::default()
                             .with_insert(existing_bit, existing)
                             .with_insert(new_bit, new_leaf),
                     ));
-                    true
+                    return true;
                 }
             }
-        }
-        Node::Interior(arr) => {
-            let bit = bit_index(hash, level);
-            let occupied = arr.bitmap().has(bit);
-            // Borrow of arc via arr ends here (NLL).
-            let Node::Interior(arr) = Arc::make_mut(arc) else {
-                unreachable!()
-            };
-            if occupied {
-                let Ok(idx) = arr.bitmap().rank(bit) else {
+            Node::Interior(arr) => {
+                let bit = bit_index(hash, level);
+                let occupied = arr.bitmap().has(bit);
+                // Borrow of current via arr ends here (NLL).
+                let Node::Interior(arr) = Arc::make_mut(current) else {
                     unreachable!()
                 };
-                insert_node(&mut arr.entries_mut()[idx], hash, key, value, level + 1)
-            } else {
-                let new_leaf = Arc::new(Node::Leaf { hash, key, value });
-                let new_arr = arr.with_insert(bit, new_leaf);
-                *arr = new_arr;
-                true
+                if occupied {
+                    let Ok(idx) = arr.bitmap().rank(bit) else {
+                        unreachable!()
+                    };
+                    ptr = &raw mut arr.entries_mut()[idx];
+                    level += 1;
+                } else {
+                    let new_leaf = Arc::new(Node::Leaf { hash, key, value });
+                    let new_arr = arr.with_insert(bit, new_leaf);
+                    *arr = new_arr;
+                    return true;
+                }
             }
-        }
-        Node::Collision { hash: h, entries } => {
-            debug_assert_eq!(*h, hash);
-            let pos = entries.iter().position(|(k, _)| k == &key);
-            // Borrow of arc via h, entries ends here (NLL).
-            let Node::Collision { entries, .. } = Arc::make_mut(arc) else {
-                unreachable!()
-            };
-            if let Some(pos) = pos {
-                entries[pos].1 = value;
-                false
-            } else {
-                entries.push((key, value));
-                true
+            Node::Collision { hash: h, entries } => {
+                debug_assert_eq!(*h, hash);
+                let pos = entries.iter().position(|(k, _)| k == &key);
+                // Borrow of current via h, entries ends here (NLL).
+                let Node::Collision { entries, .. } = Arc::make_mut(current) else {
+                    unreachable!()
+                };
+                if let Some(pos) = pos {
+                    entries[pos].1 = value;
+                    return false;
+                } else {
+                    entries.push((key, value));
+                    return true;
+                }
             }
         }
     }
