@@ -20,7 +20,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          toolchain = pkgs.rust-bin.stable.latest.default;
+          toolchain = pkgs.rust-bin.nightly.latest.default;
         in
         pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
@@ -29,6 +29,7 @@
                 "rust-src"
                 "clippy"
                 "llvm-tools-preview"
+                "miri"
               ];
             })
             rust-analyzer
